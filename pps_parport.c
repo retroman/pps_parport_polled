@@ -138,20 +138,22 @@ MODULE_PARM_DESC(ppps_mask,
 
 /* internal per-port structure */
 struct pps_client_pp {
-	bool     interrupt_disabled;
-	bool     echo;
-	struct   pardevice *pardev;
-	bool     use_hw;
-	int      mode;
-	int      poll_trys;
+	int      interrupt_disabled; /*bool*/
+	int      echo; /*bool*/
+	int      use_hw; /*bool*/
+	int      mode; /*bool*/
 	int      status_addr;
+	int      control_addr;
+	struct   pardevice *pardev;
 	unsigned int cw;
+	/* cache doesnt matter for the rest */
+	int      poll_trys;
 	unsigned int cw_err;
 	unsigned int d_dir;
 	int      poll_target;
 	int      prev_pollct;
-	struct   hrtimer hrt;
 	ktime_t  hrt_period;
+	struct   hrtimer hrt;
 	unsigned long hrt_period_ns;
 	ktime_t  hrt_initial_period;
 	unsigned int mask_jiffies;
@@ -164,7 +166,7 @@ struct pps_client_pp {
 static void pps_work(struct work_struct *work)
 {
 	struct pps_event_time ts_assert, ts_clear;
-	int addr;
+	int d_addr, c_addr;
 	unsigned long flags;
 	struct pps_client_pp *dev = 
 		container_of(work, struct pps_client_pp, dw.work);
@@ -178,33 +180,42 @@ static void pps_work(struct work_struct *work)
 		dev->interrupt_disabled = 0;
 	} else {
 		local_irq_save(flags);
-		use_hw = dev->use_hw;
+		if (true == (use_hw = dev->use_hw)) {
+			d_addr = dev->status_addr-1;
+			c_addr = dev->status_addr+1;
+		}
 		echo = dev->echo;
 		pps_get_ts(&ts_clear);
 		pps_get_ts(&ts_assert);
 		if (use_hw) {
-			addr = dev->status_addr-1;
 			if (echo)
-				outb(SEL_HI, addr+1);
+				outb(SEL_HI, c_addr);
 			pps_get_ts(&ts_assert);
-			outb(OUT_ASSERT, addr);
+			outb(OUT_ASSERT, d_addr);
 			pps_get_ts(&ts_clear);
 			if (echo)
-				outb(SEL_LO_IRQ_MASKED, addr+1);
+				outb(SEL_LO_IRQ_MASKED, c_addr);
 			udelay(10);
-			outb(OUT_CLEAR, addr);
-			/*
-			 * some devices, such as the Trimble Acutime 2000, lock
-			 * up if the pulse is asserted for too long, so don't
-			 * re-enable interrupt until after the udelay
-			 */
-			local_irq_restore(flags);
+			outb(OUT_CLEAR, d_addr);
 		} else {
 			write_control = port->ops->write_control;
 			write_data = port->ops->write_data;
-			write_data(port,0);
-			write_control(port, 0);
+			if (echo)
+				write_control(port, SEL_HI);
+			pps_get_ts(&ts_assert);
+			write_data(port, OUT_ASSERT);
+			pps_get_ts(&ts_clear);
+			if (echo)
+				write_control(port, SEL_LO_IRQ_MASKED);
+			udelay(10);
+			write_data(port, OUT_CLEAR);
 		}
+		/*
+		 * some devices, such as the Trimble Acutime 2000, lock
+		 * up if the pulse is asserted for too long, so don't
+		 * re-enable interrupt until after the udelay
+		 */
+		local_irq_restore(flags);
 	}
 }
 
@@ -214,7 +225,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 	struct pps_event_time ts_assert, ts_clear;
 	struct pps_client_pp *dev;
 	unsigned long flags;
-	int p, max_polls, addr, a_polls;
+	unsigned int cw_trys, p, max_polls, s_addr, c_addr, a_polls;
 	struct parport *port;
 	bool echo, use_hw, poll_fail;
 	unsigned char (*read_status)(struct parport *);
@@ -226,18 +237,20 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 		return HRTIMER_NORESTART; /* shutting down */
 
 	/* local copies to minimize latency becase no strict aliasing */
-	addr = dev->status_addr;
+	s_addr = dev->status_addr;
+	c_addr = s_addr+1;
 	port = dev->pardev->port;
 	max_polls = dev->poll_trys;
 	read_status = port->ops->read_status;
 	echo = dev->echo;
 	use_hw = dev->use_hw;
+	cw_trys = dev->cw;
 	write_control = port->ops->write_control;
 
 	/* prepare rising edge echo if falling edge capture disabled */
-	if (echo && !dev->cw) {
+	if (echo && cw_trys == 0) {
 		if (use_hw)
-			outb(SEL_LO_IRQ_MASKED, addr+1);
+			outb(SEL_LO_IRQ_MASKED, c_addr);
 		else
 			write_control(port, 0);
 	}
@@ -246,7 +259,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 	p = max_polls;
 	pps_get_ts(&ts_assert); /* warm up cache */
 	if (use_hw) {
-		while (p-- && (inb(addr) &
+		while (p-- && (inb(s_addr) &
 			PARPORT_STATUS_ACK) CLEARED){}
 		pps_get_ts(&ts_assert);
 	} else {
@@ -257,22 +270,21 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 	a_polls = max_polls - p;
 	if (echo && a_polls > 1 && a_polls < max_polls) {
 		if (use_hw)
-			outb(SEL_HI, addr+1);
+			outb(SEL_HI, c_addr);
 		else
 			write_control(port, PARPORT_CONTROL_SELECT);
 	}
-	if (dev->cw > 0 && a_polls > 1 && a_polls < max_polls) {
+	if (cw_trys > 0 && a_polls > 1 && a_polls < max_polls) {
 		/* NOTE: SEL will be lowered even if there was a timeout */
-		p = dev->cw;
 		pps_get_ts(&ts_clear);
 		if (use_hw) {
-			while (p-- && (inb(addr) &
+			while (cw_trys-- && (inb(s_addr) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			pps_get_ts(&ts_clear);
 			if (echo)
-				outb(SEL_LO_IRQ_MASKED, addr+1);
+				outb(SEL_LO_IRQ_MASKED, c_addr);
 		} else {
-			while (p-- && (read_status(port) &
+			while (cw_trys-- && (read_status(port) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			pps_get_ts(&ts_clear);
 			if (echo)
@@ -280,7 +292,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 		}
 
 		local_irq_restore(flags);
-		if (unlikely(p == 0)) {
+		if (unlikely(cw_trys == 0)) {
 			local_irq_restore(flags);
 			if (dev->cw_err++ >= CLEAR_WAIT_MAX_ERRORS) {
 				dev->cw = 0;
@@ -354,7 +366,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 /* parport interrupt handler */
 __aligned(64) static void parport_irq(void *handle)
 {
-	int pollct, addr;
+	unsigned int cw_trys, s_addr, c_addr;
 	unsigned long flags;
 	struct pps_client_pp *dev;
 	struct pps_event_time ts_assert, ts_clear;
@@ -383,7 +395,7 @@ __aligned(64) static void parport_irq(void *handle)
 		/* echo here before reading port, but may cause false echos */
 		if (echo) {
 			if (use_hw) {
-				outb(SEL_HI, dev->status_addr+1);
+				outb(SEL_HI, dev->control_addr);
 			} else {
 				port = dev->pardev->port;
 				port->ops->write_control(port, 0);
@@ -412,19 +424,20 @@ __aligned(64) static void parport_irq(void *handle)
 			HRTIMER_MODE_REL);
 	} else if (dev->cw) {
 		/* NOTE: SEL will be lowered even if there was a timeout */
-		pollct = dev->cw;
+		cw_trys = dev->cw;
 		pps_get_ts(&ts_clear);
 		if (use_hw) {
-			addr = dev->status_addr;
-			while (pollct-- && (inb(addr) &
+			s_addr = dev->status_addr;
+			c_addr = dev->control_addr;
+			while (cw_trys-- && (inb(s_addr) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			pps_get_ts(&ts_clear);
 			if (echo)
-				outb(SEL_LO_IRQ_UNMASKED, addr+1);
+				outb(SEL_LO_IRQ_UNMASKED, c_addr);
 		} else {
 			read_status = port->ops->read_status;
 			write_control = port->ops->write_control;
-			while (pollct-- && (read_status(port) &
+			while (cw_trys-- && (read_status(port) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			pps_get_ts(&ts_clear);
 			if (echo)
@@ -433,7 +446,7 @@ __aligned(64) static void parport_irq(void *handle)
 		local_irq_restore(flags);
 		pps_event(dev->pps, &ts_assert, PPS_CAPTUREASSERT, NULL);
 		
-		if (unlikely(pollct == 0)) {
+		if (unlikely(cw_trys == 0)) {
 			if (dev->cw_err++ >= CLEAR_WAIT_MAX_ERRORS) {
 				dev->cw = 0;
 				dev_err(dev->pps->dev, "disabled clear edge capture after %d consecutive timeouts\n",
@@ -445,7 +458,7 @@ __aligned(64) static void parport_irq(void *handle)
 		}
 	} else {
 		local_irq_restore(flags);
-		pps_event(dev->pps, &ts_assert, PPS_CAPTUREASSERT, NULL);
+		pps_event(dev->pps, &ts_assert,	PPS_CAPTUREASSERT, NULL);
 		/*
 		 * level-triggered interrupt workaround: wait before
 		 * re-enabling interrupt. The interrupt must be disabled for
@@ -475,7 +488,7 @@ ignore_irq:
 
 static void parport_attach(struct parport *port)
 {
-	int pollct, ns_perpoll, addr, port_num;
+	int pollct, ns_perpoll, s_addr, c_addr, port_num;
 	struct timespec start, end, len;
 	s64 len_ns, start_ns, end_ns;
 	unsigned long flags;
@@ -565,7 +578,9 @@ static void parport_attach(struct parport *port)
 	device->cw = clear_wait;
 	device->cw_err = 0;
 	device->status_addr = port->base + 1;
-	addr = device->status_addr;
+	device->control_addr = port->base + 2;
+	s_addr = device->status_addr;
+	c_addr = device->control_addr;
 
 	if (device->mode == PM_POLL) {
 		if (KTIME_MONOTONIC_RES != KTIME_HIGH_RES) {
@@ -585,7 +600,7 @@ static void parport_attach(struct parport *port)
 		pollct = LOOP_CAL_COUNT;
 		if ((sta & PARPORT_STATUS_BUSY) == 0) {
 			if (device->use_hw) {
-				while (pollct-- && (inb(addr) &
+				while (pollct-- && (inb(s_addr) &
 					PARPORT_STATUS_BUSY) == 0) {}
 			} else {
 				while (pollct-- && (read_status(port) &
@@ -593,7 +608,7 @@ static void parport_attach(struct parport *port)
 			}
 		} else if ((sta & PARPORT_STATUS_SELECT) == 0) {
 			if (device->use_hw) {
-				while (pollct-- && (inb(addr) &
+				while (pollct-- && (inb(s_addr) &
 					PARPORT_STATUS_SELECT) == 0) {}
 			} else {
 				while (pollct-- && (read_status(port) &
@@ -669,7 +684,7 @@ static void parport_attach(struct parport *port)
 		if (device->use_hw) {
 			getrawmonotonic(&start);
 			while (pollct--)
-				outb(SEL_LO_IRQ_MASKED, addr+1);
+				outb(SEL_LO_IRQ_MASKED, c_addr);
 			getrawmonotonic(&end);
 		} else {
 			write_control = port->ops->write_control;
