@@ -39,6 +39,7 @@
 /*#include <asm/io.h>*/
 #include <linux/io.h>
 #include <linux/delay.h>
+#include <linux/sched/clock.h>
 
 #define DRVDESC "parallel port PPS client"
 
@@ -192,7 +193,8 @@ static void pps_work(struct work_struct * __restrict const work)
 		void (* const write_data)(struct parport *, unsigned char value) = port->ops->write_data;
 
 		local_irq_save(flags);
-
+		sched_clock_idle_sleep_event();
+		
 		/* warm up cache */
 		ktime_get_snapshot(&ss_clear);
 		ktime_get_snapshot(&ss_assert);
@@ -257,8 +259,11 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 		else
 			write_control(port, 0);
 	}
-	/* wait for rising edge */
+
+	/* wait for input rising edge */
 	local_irq_save(flags);
+	sched_clock_idle_sleep_event();
+
 	p = max_polls;
 	ktime_get_snapshot(&ss_assert); /* warm up cache */
 	if (static_branch_likely(&direct)) {
@@ -593,7 +598,10 @@ static void parport_attach(struct parport * __restrict const port)
 		/* use a status pin that's low besides ACK */
 		read_status = port->ops->read_status;
 		sta = read_status(port);
+		
 		local_irq_save(flags);
+		sched_clock_idle_sleep_event();
+		
 		getrawmonotonic(&start);
 		getrawmonotonic(&end);
 		getrawmonotonic(&start);
@@ -676,9 +684,12 @@ static void parport_attach(struct parport * __restrict const port)
 	}
 
 	if (ppps_echo || device->mode == PM_OUT) {
-		/* hw inverted, use low output for echo speed test */
+		/* SEL is hw inverted, use low output for echo speed test */
 		pollct = LOOP_CAL_COUNT;
+
 		local_irq_save(flags);
+		sched_clock_idle_sleep_event();
+
 		if (static_branch_likely(&direct)) {
 			getrawmonotonic(&end);
 			getrawmonotonic(&start);
