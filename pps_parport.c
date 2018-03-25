@@ -65,16 +65,19 @@ MODULE_PARM_DESC(clear_wait,
 
 /*
  * read_status and write_control don't get inlined due to no-strict-aliasing,
- * so use inb() and outb(). echo latency is reduced significantly
- * even on fast machines
+ * and won't get inlined when built as a module even with -fstrict-aliasing and
+ * restrict pointers, so use inb() and outb(). echo latency is reduced
+ * significantly even on fast machines
  */
 static bool ppps_direct = false;
+DEFINE_STATIC_KEY_FALSE(direct);
 module_param(ppps_direct, bool, 0);
 MODULE_PARM_DESC(ppps_direct,
 	"Use direct IO, default off. Works only with PC-style hardware "
-	"(module parport_pc)");
+	"(chips that use the 'parport_pc' driver)");
 
 static bool ppps_echo = false;
+DEFINE_STATIC_KEY_FALSE(echo);
 module_param(ppps_echo, bool, 0);
 MODULE_PARM_DESC(ppps_echo, "echo ACK to SEL, default off");
 
@@ -139,12 +142,10 @@ MODULE_PARM_DESC(ppps_mask,
 /* internal per-port structure */
 struct pps_client_pp {
 	int      interrupt_disabled; /*bool*/
-	int      echo; /*bool*/
-	int      use_hw; /*bool*/
-	int      mode; /*bool*/
+	int      mode;
 	int      status_addr;
 	int      control_addr;
-	struct   pardevice *pardev;
+	struct   pardevice * __restrict pardev;
 	unsigned int cw;
 	/* cache doesnt matter for the rest */
 	int      poll_trys;
@@ -157,55 +158,62 @@ struct pps_client_pp {
 	unsigned long hrt_period_ns;
 	ktime_t  hrt_initial_period;
 	unsigned int mask_jiffies;
-	struct   workqueue_struct *wq;
+	struct   workqueue_struct * __restrict wq;
 	struct   delayed_work dw;
-	struct   pps_device *pps;
+	struct   pps_device * __restrict pps;
 };
 
-/* delayed-work handler */
-static void pps_work(struct work_struct *work)
+/* do the conversion separately to reduce echo latency */
+static void ss_pps_event(struct pps_device * __restrict pps, struct system_time_snapshot * __restrict snap, int event)
 {
-	struct pps_event_time ts_assert, ts_clear;
-	int d_addr, c_addr;
-	unsigned long flags;
-	struct pps_client_pp *dev = 
+	struct pps_event_time ts;
+	ts.ts_real = ktime_to_timespec64(snap->real);
+#ifdef CONFIG_NTP_PPS
+	ts.ts_raw = ktime_to_timespec64(snap->raw);
+#endif
+	pps_event(pps, &ts, event, NULL);
+}
+
+/* delayed-work handler */
+static void pps_work(struct work_struct * __restrict const work)
+{
+	struct pps_client_pp * __restrict const dev = 
 		container_of(work, struct pps_client_pp, dw.work);
-	struct parport *port = dev->pardev->port;
-	bool use_hw, echo;
-	void (*write_control)(struct parport *, unsigned char value);
-	void (*write_data)(struct parport *, unsigned char value);
+	struct parport * __restrict const port = dev->pardev->port;
 
 	if (dev->mode != PM_OUT) {
 		port->ops->enable_irq(port);
 		dev->interrupt_disabled = 0;
 	} else {
+		struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
+		unsigned long flags;
+		const int d_addr = dev->status_addr-1, c_addr = d_addr+2;
+		void (* const write_control)(struct parport *, unsigned char value) = port->ops->write_control;
+		void (* const write_data)(struct parport *, unsigned char value) = port->ops->write_data;
+
 		local_irq_save(flags);
-		if (true == (use_hw = dev->use_hw)) {
-			d_addr = dev->status_addr-1;
-			c_addr = dev->status_addr+1;
-		}
-		echo = dev->echo;
-		pps_get_ts(&ts_clear);
-		pps_get_ts(&ts_assert);
-		if (use_hw) {
-			if (echo)
+
+		/* warm up cache */
+		ktime_get_snapshot(&ss_clear);
+		ktime_get_snapshot(&ss_assert);
+
+		if (static_branch_likely(&direct)) {
+			if (static_branch_likely(&echo))
 				outb(SEL_HI, c_addr);
-			pps_get_ts(&ts_assert);
+			ktime_get_snapshot(&ss_assert);
 			outb(OUT_ASSERT, d_addr);
-			pps_get_ts(&ts_clear);
-			if (echo)
+			ktime_get_snapshot(&ss_clear);
+			if (static_branch_likely(&echo))
 				outb(SEL_LO_IRQ_MASKED, c_addr);
 			udelay(10);
 			outb(OUT_CLEAR, d_addr);
 		} else {
-			write_control = port->ops->write_control;
-			write_data = port->ops->write_data;
-			if (echo)
+			if (static_branch_likely(&echo))
 				write_control(port, SEL_HI);
-			pps_get_ts(&ts_assert);
+			ktime_get_snapshot(&ss_assert);
 			write_data(port, OUT_ASSERT);
-			pps_get_ts(&ts_clear);
-			if (echo)
+			ktime_get_snapshot(&ss_clear);
+			if (static_branch_likely(&echo))
 				write_control(port, SEL_LO_IRQ_MASKED);
 			udelay(10);
 			write_data(port, OUT_CLEAR);
@@ -216,40 +224,35 @@ static void pps_work(struct work_struct *work)
 		 * re-enable interrupt until after the udelay
 		 */
 		local_irq_restore(flags);
+		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
+		ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
 	}
 }
 
 /* hrtimer poll hander */
-__aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
+__aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict const timer)
 {
-	struct pps_event_time ts_assert, ts_clear;
-	struct pps_client_pp *dev;
+	struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
+	struct pps_client_pp * __restrict const dev = 
+		container_of(timer, struct pps_client_pp, hrt);
 	unsigned long flags;
-	unsigned int cw_trys, p, max_polls, s_addr, c_addr, a_polls;
-	struct parport *port;
-	bool echo, use_hw, poll_fail;
-	unsigned char (*read_status)(struct parport *);
-	void (*write_control)(struct parport *, unsigned char value);
+
+	/* local copies to minimize latency becase no strict aliasing */
+	const unsigned int max_polls = dev->poll_trys;
+	const unsigned int s_addr = dev->status_addr, c_addr = s_addr + 1;
+	unsigned int p, a_polls, cw_trys = dev->cw;
+	struct parport * __restrict const port = dev->pardev->port;
+	bool poll_fail;
+	unsigned char (* const read_status)(struct parport *) = port->ops->read_status;
+	void (* const write_control)(struct parport *, unsigned char value) = port->ops->write_control;
 	int adj;
 	
-	dev = container_of(timer, struct pps_client_pp, hrt);
 	if (dev->mode != PM_POLL)
 		return HRTIMER_NORESTART; /* shutting down */
 
-	/* local copies to minimize latency becase no strict aliasing */
-	s_addr = dev->status_addr;
-	c_addr = s_addr+1;
-	port = dev->pardev->port;
-	max_polls = dev->poll_trys;
-	read_status = port->ops->read_status;
-	echo = dev->echo;
-	use_hw = dev->use_hw;
-	cw_trys = dev->cw;
-	write_control = port->ops->write_control;
-
 	/* prepare rising edge echo if falling edge capture disabled */
-	if (echo && cw_trys == 0) {
-		if (use_hw)
+	if (ppps_echo && cw_trys == 0) {
+		if (static_branch_likely(&direct))
 			outb(SEL_LO_IRQ_MASKED, c_addr);
 		else
 			write_control(port, 0);
@@ -257,37 +260,37 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 	/* wait for rising edge */
 	local_irq_save(flags);
 	p = max_polls;
-	pps_get_ts(&ts_assert); /* warm up cache */
-	if (use_hw) {
+	ktime_get_snapshot(&ss_assert); /* warm up cache */
+	if (static_branch_likely(&direct)) {
 		while (p-- && (inb(s_addr) &
 			PARPORT_STATUS_ACK) CLEARED){}
-		pps_get_ts(&ts_assert);
+		ktime_get_snapshot(&ss_assert);
 	} else {
 		while (p-- && (read_status(port) & 
 			PARPORT_STATUS_ACK) CLEARED){}
-		pps_get_ts(&ts_assert); /* duplicate to prevent jump latency */
+		ktime_get_snapshot(&ss_assert); /* duplicate to prevent jump latency in case no static key support */
 	}
 	a_polls = max_polls - p;
-	if (echo && a_polls > 1 && a_polls < max_polls) {
-		if (use_hw)
+	if (ppps_echo && a_polls > 1 && a_polls < max_polls) {
+		if (static_branch_likely(&direct))
 			outb(SEL_HI, c_addr);
 		else
 			write_control(port, PARPORT_CONTROL_SELECT);
 	}
 	if (cw_trys > 0 && a_polls > 1 && a_polls < max_polls) {
 		/* NOTE: SEL will be lowered even if there was a timeout */
-		pps_get_ts(&ts_clear);
-		if (use_hw) {
+		ktime_get_snapshot(&ss_clear);
+		if (static_branch_likely(&direct)) {
 			while (cw_trys-- && (inb(s_addr) &
 				PARPORT_STATUS_ACK) ASSERTED){}
-			pps_get_ts(&ts_clear);
-			if (echo)
+			ktime_get_snapshot(&ss_clear);
+			if (static_branch_likely(&echo))
 				outb(SEL_LO_IRQ_MASKED, c_addr);
 		} else {
 			while (cw_trys-- && (read_status(port) &
 				PARPORT_STATUS_ACK) ASSERTED){}
-			pps_get_ts(&ts_clear);
-			if (echo)
+			ktime_get_snapshot(&ss_clear);
+			if (static_branch_likely(&echo))
 				write_control(port, 0);
 		}
 
@@ -316,9 +319,9 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 			"poll timeout, disabling polling until next interrupt\n");
 	} else {
 		poll_fail = false;
-		pps_event(dev->pps, &ts_assert, PPS_CAPTUREASSERT, NULL);
+		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
 		if (dev->cw > 0)
-			pps_event(dev->pps, &ts_clear, PPS_CAPTURECLEAR, NULL);
+			ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
 	}
 
 	if (unlikely(poll_fail)) {
@@ -364,16 +367,15 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer *timer)
 }
 
 /* parport interrupt handler */
-__aligned(64) static void parport_irq(void *handle)
+__aligned(64) static void parport_irq(void * __restrict const handle)
 {
 	unsigned int cw_trys, s_addr, c_addr;
 	unsigned long flags;
-	struct pps_client_pp *dev;
-	struct pps_event_time ts_assert, ts_clear;
-	struct parport *port;
+	struct pps_client_pp * __restrict dev;
+	struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
+	struct parport * __restrict port;
 	unsigned char (*read_status)(struct parport *);
 	void (*write_control)(struct parport *, unsigned char value);
-	bool echo, use_hw;
 	
 	/* don't get interrupted while getting timestamp */
 	local_irq_save(flags);
@@ -382,19 +384,17 @@ __aligned(64) static void parport_irq(void *handle)
 	 * get the timestamp here even in polling mode. will waste CPU
 	 * in polled mode, and if using a shared interrupt, but reduces latency
 	 */
-	pps_get_ts(&ts_assert);
+	ktime_get_snapshot(&ss_assert);
 
 	dev = handle;
 	if (unlikely(dev->interrupt_disabled)) {
 		goto ignore_irq; /* not our interrupt */
 	}
 	
-	echo = dev->echo;
-	use_hw = dev->use_hw;
 	if (dev->mode == PM_INT) {
 		/* echo here before reading port, but may cause false echos */
-		if (echo) {
-			if (use_hw) {
+		if (static_branch_likely(&echo)) {
+			if (static_branch_likely(&direct)) {
 				outb(SEL_HI, dev->control_addr);
 			} else {
 				port = dev->pardev->port;
@@ -425,26 +425,27 @@ __aligned(64) static void parport_irq(void *handle)
 	} else if (dev->cw) {
 		/* NOTE: SEL will be lowered even if there was a timeout */
 		cw_trys = dev->cw;
-		pps_get_ts(&ts_clear);
-		if (use_hw) {
+		if (static_branch_likely(&direct)) {
 			s_addr = dev->status_addr;
 			c_addr = dev->control_addr;
+			ktime_get_snapshot(&ss_clear);
 			while (cw_trys-- && (inb(s_addr) &
 				PARPORT_STATUS_ACK) ASSERTED){}
-			pps_get_ts(&ts_clear);
-			if (echo)
+			ktime_get_snapshot(&ss_clear);
+			if (static_branch_likely(&echo))
 				outb(SEL_LO_IRQ_UNMASKED, c_addr);
 		} else {
 			read_status = port->ops->read_status;
 			write_control = port->ops->write_control;
+			ktime_get_snapshot(&ss_clear);
 			while (cw_trys-- && (read_status(port) &
 				PARPORT_STATUS_ACK) ASSERTED){}
-			pps_get_ts(&ts_clear);
-			if (echo)
+			ktime_get_snapshot(&ss_clear);
+			if (static_branch_likely(&echo))
 				write_control(port, PARPORT_CONTROL_SELECT);
 		}
 		local_irq_restore(flags);
-		pps_event(dev->pps, &ts_assert, PPS_CAPTUREASSERT, NULL);
+		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
 		
 		if (unlikely(cw_trys == 0)) {
 			if (dev->cw_err++ >= CLEAR_WAIT_MAX_ERRORS) {
@@ -453,12 +454,12 @@ __aligned(64) static void parport_irq(void *handle)
 					CLEAR_WAIT_MAX_ERRORS);
 			}
 		} else {
-			pps_event(dev->pps, &ts_clear, PPS_CAPTURECLEAR, NULL);
+			ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
 			dev->cw_err = 0;
 		}
 	} else {
 		local_irq_restore(flags);
-		pps_event(dev->pps, &ts_assert,	PPS_CAPTUREASSERT, NULL);
+		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
 		/*
 		 * level-triggered interrupt workaround: wait before
 		 * re-enabling interrupt. The interrupt must be disabled for
@@ -471,14 +472,14 @@ __aligned(64) static void parport_irq(void *handle)
 				dev->mask_jiffies);
 		}
 		/* lower echo to create next echo rising edge */
-		if (echo)
+		if (ppps_echo)
 			port->ops->write_control(port, PARPORT_CONTROL_SELECT);
 	}
 	return;
 
 ignore_irq_report:
 	dev_err(dev->pps->dev, "lost the signal (are you using a shared interrupt?)\n");
-	if (echo) {
+	if (ppps_echo) {
 		port = dev->pardev->port;
 		port->ops->write_control(port, PARPORT_CONTROL_SELECT);
 	}
@@ -486,7 +487,7 @@ ignore_irq:
 	local_irq_restore(flags);
 }
 
-static void parport_attach(struct parport *port)
+static void parport_attach(struct parport * __restrict const port)
 {
 	int pollct, ns_perpoll, s_addr, c_addr, port_num;
 	struct timespec start, end, len;
@@ -496,7 +497,7 @@ static void parport_attach(struct parport *port)
 	void (*write_control)(struct parport *, unsigned char value);
 	unsigned char sta;
 	
-	struct pps_client_pp *device;
+	struct pps_client_pp * __restrict device;
 	struct pps_source_info info = {
 		.name		= KBUILD_MODNAME,
 		.path		= "",
@@ -566,11 +567,12 @@ static void parport_attach(struct parport *port)
 		goto err_release_source;
 	}
 	
-	if ((true  == (device->use_hw = ppps_direct)) &&
-		(port->modes & PARPORT_MODE_PCSPP) == 0)
-		pr_info("NOTE: ppps_direct enabled, but %s PARPORT_MODE_PCSPP bit is not set\n",
-			port->name);
-
+	if (ppps_direct) {
+		static_branch_enable(&direct);
+		if ((port->modes & PARPORT_MODE_PCSPP) == 0)
+			pr_info("NOTE: ppps_direct enabled, but %s PARPORT_MODE_PCSPP bit is not set\n",
+				port->name);
+	}
 	/* start with interrupt pin masked */
 	port->ops->disable_irq(port);
 	device->interrupt_disabled = 1;
@@ -599,7 +601,7 @@ static void parport_attach(struct parport *port)
 		getrawmonotonic(&start);
 		pollct = LOOP_CAL_COUNT;
 		if ((sta & PARPORT_STATUS_BUSY) == 0) {
-			if (device->use_hw) {
+			if (static_branch_likely(&direct)) {
 				while (pollct-- && (inb(s_addr) &
 					PARPORT_STATUS_BUSY) == 0) {}
 			} else {
@@ -607,7 +609,7 @@ static void parport_attach(struct parport *port)
 					PARPORT_STATUS_BUSY) == 0) {}
 			}
 		} else if ((sta & PARPORT_STATUS_SELECT) == 0) {
-			if (device->use_hw) {
+			if (static_branch_likely(&direct)) {
 				while (pollct-- && (inb(s_addr) &
 					PARPORT_STATUS_SELECT) == 0) {}
 			} else {
@@ -675,19 +677,19 @@ static void parport_attach(struct parport *port)
 		device->mask_jiffies = msecs_to_jiffies(ppps_interval);
 	}
 
-	device->echo = ppps_echo;
-	if (device->echo || device->mode == PM_OUT) {
+	if (ppps_echo || device->mode == PM_OUT) {
 		/* hw inverted, use low output for echo speed test */
 		pollct = LOOP_CAL_COUNT;
 		local_irq_save(flags);
-		getrawmonotonic(&end);
-		if (device->use_hw) {
+		if (static_branch_likely(&direct)) {
+			getrawmonotonic(&end);
 			getrawmonotonic(&start);
 			while (pollct--)
 				outb(SEL_LO_IRQ_MASKED, c_addr);
 			getrawmonotonic(&end);
 		} else {
 			write_control = port->ops->write_control;
+			getrawmonotonic(&end);
 			getrawmonotonic(&start);
 			while (pollct--)
 				write_control(port, PARPORT_CONTROL_SELECT);
@@ -805,11 +807,14 @@ static int __init pps_parport_init(void)
 		pr_info("clear edge capture disabled\n"); 
 	}
 
-	if (ppps_direct)
+	if (ppps_direct) {
 		pr_info("using port IO instructions directly\n");
-		
-	if (ppps_echo)
+		static_branch_enable(&direct);
+	}
+	if (ppps_echo) {
 		pr_info("SEL pin echo enabled\n");
+		static_branch_enable(&echo);
+	}
 
 	ret = parport_register_driver(&pps_parport_driver);
 	if (ret) {
