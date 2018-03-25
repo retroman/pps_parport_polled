@@ -567,12 +567,10 @@ static void parport_attach(struct parport * __restrict const port)
 		goto err_release_source;
 	}
 	
-	if (ppps_direct) {
-		static_branch_enable(&direct);
-		if ((port->modes & PARPORT_MODE_PCSPP) == 0)
-			pr_info("NOTE: ppps_direct enabled, but %s PARPORT_MODE_PCSPP bit is not set\n",
-				port->name);
-	}
+	if (ppps_direct && ((port->modes & PARPORT_MODE_PCSPP) == 0))
+		pr_info("NOTE: ppps_direct enabled, but %s PARPORT_MODE_PCSPP bit is not set\n",
+		        port->name);
+
 	/* start with interrupt pin masked */
 	port->ops->disable_irq(port);
 	device->interrupt_disabled = 1;
