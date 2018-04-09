@@ -44,6 +44,7 @@
 #define DRVDESC "parallel port PPS client"
 
 /* module parameters */
+#define PM_SHUTDOWN -1
 #define PM_INT  0
 #define PM_POLL 1
 #define PM_OUT  2
@@ -182,14 +183,32 @@ static void pps_work(struct work_struct * __restrict const work)
 		container_of(work, struct pps_client_pp, dw.work);
 	struct parport * __restrict const port = dev->pardev->port;
 
-	if (dev->mode != PM_OUT) {
-		port->ops->enable_irq(port);
-		dev->interrupt_disabled = 0;
-	} else {
-		struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
-		unsigned long flags;
-		const int d_addr = dev->status_addr-1, c_addr = d_addr+2;
-		void (* const write_control)(struct parport *, unsigned char value) = port->ops->write_control;
+	port->ops->enable_irq(port);
+	dev->interrupt_disabled = 0;
+}
+
+/* hrtimer poll hander */
+__aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict const timer)
+{
+	struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
+	struct pps_client_pp * __restrict const dev = 
+		container_of(timer, struct pps_client_pp, hrt);
+	unsigned long flags;
+
+	/* local copies to minimize latency becase no strict aliasing */
+	const unsigned int max_polls = dev->poll_trys;
+	const unsigned int s_addr = dev->status_addr, c_addr = s_addr + 1;
+	unsigned int p, a_polls, cw_trys = dev->cw;
+	struct parport * __restrict const port = dev->pardev->port;
+	bool poll_fail;
+	unsigned char (* const read_status)(struct parport *) = port->ops->read_status;
+	void (* const write_control)(struct parport *, unsigned char value) = port->ops->write_control;
+	int adj;
+	
+	if (dev->mode == PM_SHUTDOWN) {
+		return HRTIMER_NORESTART; /* shutting down */
+	}else if (dev->mode == PM_OUT) {
+		const int d_addr = s_addr-1;
 		void (* const write_data)(struct parport *, unsigned char value) = port->ops->write_data;
 
 		local_irq_save(flags);
@@ -228,30 +247,12 @@ static void pps_work(struct work_struct * __restrict const work)
 		local_irq_restore(flags);
 		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
 		ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
+
+		/* forward_now rearms without including handler execution time */
+		hrtimer_forward_now(timer, dev->hrt_period);
+		return HRTIMER_RESTART;
 	}
-}
-
-/* hrtimer poll hander */
-__aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict const timer)
-{
-	struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
-	struct pps_client_pp * __restrict const dev = 
-		container_of(timer, struct pps_client_pp, hrt);
-	unsigned long flags;
-
-	/* local copies to minimize latency becase no strict aliasing */
-	const unsigned int max_polls = dev->poll_trys;
-	const unsigned int s_addr = dev->status_addr, c_addr = s_addr + 1;
-	unsigned int p, a_polls, cw_trys = dev->cw;
-	struct parport * __restrict const port = dev->pardev->port;
-	bool poll_fail;
-	unsigned char (* const read_status)(struct parport *) = port->ops->read_status;
-	void (* const write_control)(struct parport *, unsigned char value) = port->ops->write_control;
-	int adj;
 	
-	if (dev->mode != PM_POLL)
-		return HRTIMER_NORESTART; /* shutting down */
-
 	/* prepare rising edge echo if falling edge capture disabled */
 	if (ppps_echo && cw_trys == 0) {
 		if (static_branch_likely(&direct))
@@ -365,9 +366,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 	}
 	dev->prev_pollct = a_polls;
 
-	/* forward_now rearms without including handler execution time */
 	hrtimer_forward_now(timer, dev->hrt_period);
-
 	return HRTIMER_RESTART;
 }
 
@@ -680,7 +679,17 @@ static void parport_attach(struct parport * __restrict const port)
 	} else if (device->mode == PM_INT) {
 		device->mask_jiffies = msecs_to_jiffies(ppps_mask);
 	} else {
-		device->mask_jiffies = msecs_to_jiffies(ppps_interval);
+		if (KTIME_MONOTONIC_RES != KTIME_HIGH_RES) {
+			pr_err("output mode requested, but hrtimer_resolution didn't report KTIME_HIGH_RES\n");
+			goto err_release_source;
+		}
+		pr_info("using output mode with interval of %d milliseconds\n",
+			ppps_interval);
+
+		hrtimer_init(&device->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		device->hrt.function = pps_hrt;
+		device->hrt_period_ns = ppps_interval * 1000000;
+		device->hrt_period = ktime_set(0, device->hrt_period_ns);
 	}
 
 	if (ppps_echo || device->mode == PM_OUT) {
@@ -726,7 +735,8 @@ static void parport_attach(struct parport * __restrict const port)
 		queue_delayed_work(device->wq, &device->dw, STARTUP_DELAY);
 	} else {
 		/* start pulsing */
-		queue_delayed_work(device->wq, &device->dw, device->mask_jiffies);
+		hrtimer_start(&device->hrt, device->hrt_period,
+		              HRTIMER_MODE_REL);
 	}
 	
 	return;
@@ -762,8 +772,8 @@ static void parport_detach(struct parport *port)
 
 	device = pardev->private;
 	if (device->wq) {
-		if (device->mode == PM_POLL) {
-			device->mode = PM_INT; /* flag hrt callback */
+		if (device->mode != PM_INT) {
+			device->mode = PM_SHUTDOWN; /* flag hrt callback */
 			/* wait in case polling is in progress */
 			msleep(100);
 			hrtimer_cancel(&device->hrt);
