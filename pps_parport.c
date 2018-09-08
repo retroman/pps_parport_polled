@@ -58,9 +58,10 @@ MODULE_PARM_DESC(ppps_mode,
 	"2 for output timestamping");
 
 #define CLEAR_WAIT_MAX 1000
-static unsigned int clear_wait = 100;
-module_param(clear_wait, uint, 0);
+static unsigned int clear_wait[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 100};
+module_param_array(clear_wait, uint, NULL, 0);
 MODULE_PARM_DESC(clear_wait,
+	"per-port: "
 	"Maximum number of port reads when polling for signal 'clear' edge, "
 	"0-1000, default 100, 0 disables. NOTE: Many GPS device manuals "
 	"state that their clear edges are not to be used for timing.");
@@ -75,26 +76,65 @@ static bool ppps_direct = false;
 DEFINE_STATIC_KEY_FALSE(direct);
 module_param(ppps_direct, bool, 0);
 MODULE_PARM_DESC(ppps_direct,
+	"for all ports: "
 	"Use direct IO, default off. Works only with PC-style hardware "
 	"(chips that use the 'parport_pc' driver)");
 
 static bool ppps_echo = false;
 DEFINE_STATIC_KEY_FALSE(echo);
 module_param(ppps_echo, bool, 0);
-MODULE_PARM_DESC(ppps_echo, "echo ACK to SEL, default off");
+MODULE_PARM_DESC(ppps_echo, 
+	"for all ports: in input modes, echo ACK to SEL. in output mode, "
+	" raise SEL after timestamp calcuation. default off");
 
-static unsigned int ppps_interval = 1000;
-module_param(ppps_interval, uint, 0);
+static unsigned int ppps_interval[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 1000};
+module_param_array(ppps_interval, uint, NULL, 0);
 MODULE_PARM_DESC(ppps_interval,
-	"polling and output mode: expected/generated PPS interval "
+	"per-port, polling and output mode: expected/generated PPS interval "
 	"in milliseconds, 500-10000, default 1000ms");
 
-static unsigned int ppps_mask = 0;
-module_param(ppps_mask, uint, 0);
+static unsigned int ppps_mask[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 0};
+module_param_array(ppps_mask, uint, NULL, 0);
 MODULE_PARM_DESC(ppps_mask,
-	"interrupt-mode pulse mask time in milliseconds, 0 or 100-10000, "
+	"per-port, interrupt mode only: "
+	"pulse mask time in milliseconds, 0 or 100-10000, "
 	"default 0 (disabled). Used to prevent recapture on level-triggered "
 	"hardware. Activates only when falling edge capture is disabled.");
+
+static unsigned int ppps_out_width[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 2000};
+module_param_array(ppps_out_width, uint, NULL, 0);
+MODULE_PARM_DESC(ppps_out_width,
+	"per-port, output mode only: pulse duration in microseconds, "
+	"0 to 90000, default 2000. 0 gives minimum pulse width. Interrupts "
+	"are disabled while asserting for widths less than 100 microseconds");
+
+static unsigned int ppps_out_offset[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 0};
+module_param_array(ppps_out_offset, uint, NULL, 0);
+MODULE_PARM_DESC(ppps_out_offset,
+	"per-port, output mode only: pulse assert edge offset time, "
+	"from top of second in milliseconds, 0 to 999, default 0. "
+	"IMPORTANT NOTE: to maintain consistent pulse timing the "
+	"'top of second' is arbitrary. this parameter is only useful "
+	"to add relative offsets when using multiple output ports");
+
+static bool ppps_out_ts_clear_edge[PARPORT_MAX+1] = 
+	{[0 ... PARPORT_MAX] = false};
+module_param_array(ppps_out_ts_clear_edge, bool, NULL, false);
+MODULE_PARM_DESC(ppps_out_ts_clear_edge,
+	"per-port, output mode only: edge to take timestamp on, "
+	"true for clear edge, false for assert edge. default false");
+
+static unsigned char ppps_out_assert_val[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 0x01};
+module_param_array(ppps_out_assert_val, byte, NULL, 0);
+MODULE_PARM_DESC(ppps_out_assert_val,
+	"per-port, output mode only: value to place on data port when "
+	"asserting pulse, 0x00 to 0xff, default 0x01");
+
+static unsigned char ppps_out_clear_val[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 0x00};
+module_param_array(ppps_out_clear_val, byte, NULL, 0);
+MODULE_PARM_DESC(ppps_out_clear_val,
+	"per-port, output mode only: value to place on data port when "
+	"idle (pulse cleared), 0x00 to 0xff, default 0x00");
 
 /*
  * parallel ports are supposed to trigger an interrupt on the low-to-high
@@ -137,21 +177,24 @@ MODULE_PARM_DESC(ppps_mask,
 #define LOOP_CAL_COUNT 10000
 #define MIN_TRYS 20
 
-
-#define OUT_ASSERT 0x01
-#define OUT_CLEAR  0x00
-
 static DEFINE_IDA(pps_client_index);
 
 /* internal per-port structure */
 struct pps_client_pp {
-	int      interrupt_disabled; /*bool*/
+	int      interrupt_disabled; /*bool, but use int for alignment*/
 	int      mode;
 	int      status_addr;
 	int      control_addr;
 	struct   pardevice * __restrict pardev;
-	unsigned int cw;
 	/* cache doesnt matter for the rest */
+	unsigned int cw;
+	unsigned int interval;
+	unsigned int out_width;
+	int      out_offset;
+	int      out_ts_clear_edge; /*bool*/
+	int      out_waiting_for_clear_edge; /*bool*/
+	unsigned char out_assert_val;
+	unsigned char out_clear_val;
 	int      poll_trys;
 	unsigned int cw_err;
 	unsigned int d_dir;
@@ -201,61 +244,158 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 	/* local copies to minimize latency becase no strict aliasing */
 	const unsigned int max_polls = dev->poll_trys;
 	const unsigned int s_addr = dev->status_addr, c_addr = s_addr + 1;
+	const unsigned char assert = dev->out_assert_val;
+	const unsigned char clear = dev->out_clear_val;
+	const int width = dev->out_width;
 	unsigned int p, a_polls, cw_trys = dev->cw;
 	struct parport * __restrict const port = dev->pardev->port;
 	bool poll_fail;
 	unsigned char (* const read_status)(struct parport *) = port->ops->read_status;
 	void (* const write_control)(struct parport *, unsigned char value) = port->ops->write_control;
 	int adj;
-	
-	if (dev->mode == PM_SHUTDOWN) {
+
+	if (dev->mode == PM_SHUTDOWN && !dev->out_waiting_for_clear_edge) {
 		return HRTIMER_NORESTART; /* shutting down */
-	}else if (dev->mode == PM_OUT) {
+	}else if (dev->mode == PM_OUT || dev->out_waiting_for_clear_edge) {
 		const int d_addr = s_addr-1;
 		void (* const write_data)(struct parport *, unsigned char value) = port->ops->write_data;
 
+		if (dev->out_waiting_for_clear_edge) {
+			dev->out_waiting_for_clear_edge = 0;
+			if (dev->out_ts_clear_edge) {
+				local_irq_save(flags);
+				sched_clock_idle_sleep_event();
+				
+				/* warm up cache */
+				ktime_get_snapshot(&ss_clear);
+				ktime_get_snapshot(&ss_assert);
+				
+				if (static_branch_likely(&direct)) {
+					if (static_branch_likely(&echo))
+						outb(SEL_HI, c_addr);
+					ktime_get_snapshot(&ss_assert);
+					outb(clear, d_addr);
+					ktime_get_snapshot(&ss_clear);
+					if (static_branch_likely(&echo))
+						outb(SEL_LO_IRQ_MASKED, c_addr);
+				} else {
+					if (static_branch_likely(&echo))
+						write_control(port, SEL_HI);
+					ktime_get_snapshot(&ss_assert);
+					write_data(port, clear);
+					ktime_get_snapshot(&ss_clear);
+					if (static_branch_likely(&echo))
+						write_control(port, SEL_LO_IRQ_MASKED);
+				}
+				local_irq_restore(flags);
+				
+				ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
+				ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
+			} else {
+				if (static_branch_likely(&direct))
+					outb(clear, d_addr);
+				else
+					write_data(port, clear);
+			}
+
+			/* wait remaining interval */
+			dev->hrt_period = ns_to_ktime(dev->hrt_period_ns);
+			
+			dev->hrt_period = ktime_sub_ns(dev->hrt_period, width * 1000);
+			hrtimer_forward_now(timer, dev->hrt_period);
+			
+			/* shutdown is held off until clear has been done */
+			if (dev->mode != PM_SHUTDOWN)
+				return HRTIMER_RESTART;
+			else
+				return HRTIMER_NORESTART;
+		}
+
 		local_irq_save(flags);
 		sched_clock_idle_sleep_event();
-		
-		/* warm up cache */
-		ktime_get_snapshot(&ss_clear);
-		ktime_get_snapshot(&ss_assert);
+		if (!dev->out_ts_clear_edge) {
+			/* warm up cache */
+			ktime_get_snapshot(&ss_clear);
+			ktime_get_snapshot(&ss_assert);
 
-		if (static_branch_likely(&direct)) {
-			if (static_branch_likely(&echo))
-				outb(SEL_HI, c_addr);
-			ktime_get_snapshot(&ss_assert);
-			outb(OUT_ASSERT, d_addr);
-			ktime_get_snapshot(&ss_clear);
-			if (static_branch_likely(&echo))
-				outb(SEL_LO_IRQ_MASKED, c_addr);
-			udelay(10);
-			outb(OUT_CLEAR, d_addr);
+			if (static_branch_likely(&direct)) {
+				if (static_branch_likely(&echo))
+					outb(SEL_HI, c_addr);
+				ktime_get_snapshot(&ss_assert);
+				outb(assert, d_addr);
+				ktime_get_snapshot(&ss_clear);
+				if (static_branch_likely(&echo))
+					outb(SEL_LO_IRQ_MASKED, c_addr);
+			} else {
+				if (static_branch_likely(&echo))
+					write_control(port, SEL_HI);
+				ktime_get_snapshot(&ss_assert);
+				write_data(port, assert);
+				ktime_get_snapshot(&ss_clear);
+				if (static_branch_likely(&echo))
+					write_control(port, SEL_LO_IRQ_MASKED);
+			}
 		} else {
-			if (static_branch_likely(&echo))
-				write_control(port, SEL_HI);
-			ktime_get_snapshot(&ss_assert);
-			write_data(port, OUT_ASSERT);
-			ktime_get_snapshot(&ss_clear);
-			if (static_branch_likely(&echo))
-				write_control(port, SEL_LO_IRQ_MASKED);
-			udelay(10);
-			write_data(port, OUT_CLEAR);
+			if (static_branch_likely(&direct))
+				outb(assert, d_addr);
+			else
+				write_data(port, assert);
 		}
-		/*
-		 * some devices, such as the Trimble Acutime 2000, lock
-		 * up if the pulse is asserted for too long, so don't
-		 * re-enable interrupt until after the udelay
-		 */
-		local_irq_restore(flags);
-		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
-		ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
+		
+		if (width < 100) {
+			if (width > 0)
+				udelay(width);
+
+			if (dev->out_ts_clear_edge) {
+				/* warm up cache */
+				ktime_get_snapshot(&ss_clear);
+				ktime_get_snapshot(&ss_assert);
+
+				if (static_branch_likely(&direct)) {
+					if (static_branch_likely(&echo))
+						outb(SEL_HI, c_addr);
+					ktime_get_snapshot(&ss_assert);
+					outb(clear, d_addr);
+					ktime_get_snapshot(&ss_clear);
+					if (static_branch_likely(&echo))
+						outb(SEL_LO_IRQ_MASKED, c_addr);
+				} else {
+					if (static_branch_likely(&echo))
+						write_control(port, SEL_HI);
+					ktime_get_snapshot(&ss_assert);
+					write_data(port, clear);
+					ktime_get_snapshot(&ss_clear);
+					if (static_branch_likely(&echo))
+						write_control(port, SEL_LO_IRQ_MASKED);
+				}
+			} else {
+				if (static_branch_likely(&direct))
+					outb(clear, d_addr);
+				else
+					write_data(port, clear);
+			}
+			local_irq_restore(flags);
+			
+			ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
+			ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
+		} else {
+			local_irq_restore(flags);
+
+ 			if (!dev->out_ts_clear_edge) {
+ 				ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
+ 				ss_pps_event(dev->pps, &ss_clear, PPS_CAPTURECLEAR);
+ 			}
+
+			/* set next wait to assert width */
+			dev->hrt_period = ns_to_ktime(width * 1000);
+			dev->out_waiting_for_clear_edge = 1;
+		}
 
 		/* forward_now rearms without including handler execution time */
 		hrtimer_forward_now(timer, dev->hrt_period);
 		return HRTIMER_RESTART;
 	}
-	
+
 	/* prepare rising edge echo if falling edge capture disabled */
 	if (ppps_echo && cw_trys == 0) {
 		if (static_branch_likely(&direct))
@@ -317,7 +457,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 	} else {
 		local_irq_restore(flags);
 	}
-	
+
 	if (unlikely(a_polls == 1)) {
 		poll_fail = true;
 		dev_info(dev->pps->dev,
@@ -335,7 +475,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 
 	if (unlikely(poll_fail)) {
 		/* reset to standard interval */
-		dev->hrt_period = ktime_set(0, dev->hrt_period_ns);
+		dev->hrt_period = ns_to_ktime(dev->hrt_period_ns);
 		dev->prev_pollct = dev->poll_target;
 
 		/*
@@ -343,7 +483,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 		 * triggering the interrupt handler with the current pulse
 		 */
 		queue_delayed_work(dev->wq, &dev->dw, dev->mask_jiffies);
-		
+
 		return HRTIMER_NORESTART;
 	}
 
@@ -383,7 +523,7 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 	struct parport * __restrict port;
 	unsigned char (*read_status)(struct parport *);
 	void (*write_control)(struct parport *, unsigned char value);
-	
+
 	/* don't get interrupted while getting timestamp */
 	local_irq_save(flags);
 
@@ -397,7 +537,7 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 	if (unlikely(dev->interrupt_disabled)) {
 		goto ignore_irq; /* not our interrupt */
 	}
-	
+
 	if (dev->mode == PM_INT) {
 		/* echo here before reading port, but may cause false echos */
 		if (static_branch_likely(&echo)) {
@@ -453,7 +593,7 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 		}
 		local_irq_restore(flags);
 		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
-		
+
 		if (unlikely(cw_trys == 0)) {
 			if (dev->cw_err++ >= CLEAR_WAIT_MAX_ERRORS) {
 				dev->cw = 0;
@@ -505,7 +645,7 @@ static void parport_attach(struct parport * __restrict const port)
 	unsigned char (*read_status)(struct parport *);
 	void (*write_control)(struct parport *, unsigned char value);
 	unsigned char sta;
-	
+
 	struct pps_client_pp * __restrict device;
 	struct pps_source_info info = {
 		.name		= KBUILD_MODNAME,
@@ -521,7 +661,6 @@ static void parport_attach(struct parport * __restrict const port)
 				  PPS_CANWAIT | PPS_TSFMT_TSPEC,
 		.owner		= THIS_MODULE,
 		.dev		= NULL
-		
 	};
 
 	device = kzalloc(sizeof(struct pps_client_pp), GFP_KERNEL);
@@ -544,7 +683,7 @@ static void parport_attach(struct parport * __restrict const port)
 		pr_err("couldn't register with %s\n", port->name);
 		goto err_free;
 	}
-	
+
 	if (parport_claim_or_block(device->pardev) < 0) {
 		pr_err("couldn't claim %s\n", port->name);
 		goto err_unregister_dev;
@@ -568,6 +707,11 @@ static void parport_attach(struct parport * __restrict const port)
 		pr_info("pps%d attached to %s at 0x%lx\n",
 			device->pps->id, port->name, port->base);
 
+	if (ppps_direct && ((port->modes & PARPORT_MODE_PCSPP) == 0))
+		pr_info("NOTE: ppps_direct enabled, but %s PARPORT_MODE_PCSPP bit is not set\n",
+		        port->name);
+
+	/* check per-port parameters specified at module load time*/
 	port_num = -1;
 	sta = kstrtoint(&port->name[strcspn(port->name, "0123456789")], 10, &port_num);
 
@@ -582,16 +726,54 @@ static void parport_attach(struct parport * __restrict const port)
 			device->mode, port->name);
 		goto err_release_source;
 	}
+
+	device->interval = ppps_interval[port_num];
+	if (device->interval > 10000 || device->interval < 500) {
+		pr_err("Expected PPS interval of %d for %s is out of range. must be 500 to 10000 (milliseconds)\n",
+			device->interval, port->name);
+		goto err_release_source;
+	}
+
+	device->cw = clear_wait[port_num];
+	if (device->cw > CLEAR_WAIT_MAX) {
+		pr_err("clear_wait value of %d polls for %s is out of range. must be 0 to %d\n",
+			device->cw, port->name, CLEAR_WAIT_MAX);
+		goto err_release_source;
+	} else if (clear_wait == 0) {
+		pr_info("clear edge capture disabled\n");
+	}
+
+	if (ppps_mask[port_num] != 0 &&
+	    (ppps_mask[port_num] > 10000 || ppps_mask[port_num] < 100)) {
+		pr_err("Interrupt mask value of %d for %s is out of range. must be 0 or 100 to 10000 (milliseconds)\n",
+			ppps_mask[port_num], port->name);
+		goto err_release_source;
+	}
+
+	device->out_width = ppps_out_width[port_num];
+	if (device->out_width > 90000) {
+		pr_err("Output pulse width of %d for %s is out of range. must be 1 to 90000 (microseconds)\n",
+			device->out_width, port->name);
+		goto err_release_source;
+	}
+	/* todo: check minimum clear time */
+	if ((device->interval * 1000) - device->out_width < 100) {
+		pr_err("Output pulse width of %d for %s is too wide for interval. pulse must be clear for at least 100 microseconds \n",
+			device->out_width, port->name);
+		goto err_release_source;
+	}
 	
-	if (ppps_direct && ((port->modes & PARPORT_MODE_PCSPP) == 0))
-		pr_info("NOTE: ppps_direct enabled, but %s PARPORT_MODE_PCSPP bit is not set\n",
-		        port->name);
+	device->out_offset = ppps_out_offset[port_num];
+	if (device->out_offset > 999) {
+		pr_err("Output offset value of %d for %s is out of range. must be 0 to 999 (milliseconds)\n",
+			ppps_mask[port_num], port->name);
+		goto err_release_source;
+	}
 
 	/* start with interrupt pin masked */
 	port->ops->disable_irq(port);
 	device->interrupt_disabled = 1;
 
-	device->cw = clear_wait;
 	device->cw_err = 0;
 	device->status_addr = port->base + 1;
 	device->control_addr = port->base + 2;
@@ -604,15 +786,15 @@ static void parport_attach(struct parport * __restrict const port)
 			goto err_release_source;
 		}
 		pr_info("using hrtimer polling mode with expected PPS interval of %d milliseconds\n",
-			ppps_interval);
+			device->interval);
 
 		/* use a status pin that's low besides ACK */
 		read_status = port->ops->read_status;
 		sta = read_status(port);
-		
+
 		local_irq_save(flags);
 		sched_clock_idle_sleep_event();
-		
+
 		getrawmonotonic(&start);
 		getrawmonotonic(&end);
 		getrawmonotonic(&start);
@@ -680,28 +862,36 @@ static void parport_attach(struct parport * __restrict const port)
 		device->prev_pollct = device->poll_target;
 
 		/* interrupt mask time for polling loop failure */
-		device->mask_jiffies = msecs_to_jiffies(ppps_interval - 100);
+		device->mask_jiffies = msecs_to_jiffies(device->interval - 100);
 
 		hrtimer_init(&device->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		device->hrt.function = pps_hrt;
-		device->hrt_period_ns = ppps_interval * 1000000;
-		device->hrt_period = ktime_set(0, device->hrt_period_ns);
-		device->hrt_initial_period = ktime_set(0, 
+		device->hrt_period_ns = device->interval * 1000000;
+		device->hrt_period = ns_to_ktime(device->hrt_period_ns);
+		device->hrt_initial_period = ns_to_ktime( 
 			device->hrt_period_ns - (POLL_START_US * 1000));
 	} else if (device->mode == PM_INT) {
-		device->mask_jiffies = msecs_to_jiffies(ppps_mask);
+		device->mask_jiffies = msecs_to_jiffies(ppps_mask[port_num]);
 	} else {
 		if (KTIME_MONOTONIC_RES != KTIME_HIGH_RES) {
-			pr_err("output mode requested, but hrtimer_resolution didn't report KTIME_HIGH_RES\n");
+			pr_err("%s output mode requested, but hrtimer_resolution didn't report KTIME_HIGH_RES\n",
+			       port->name);
 			goto err_release_source;
 		}
-		pr_info("using output mode with interval of %d milliseconds\n",
-			ppps_interval);
+		device->out_ts_clear_edge = 
+			(int)ppps_out_ts_clear_edge[port_num];
+		device->out_assert_val = ppps_out_assert_val[port_num];
+		device->out_clear_val = ppps_out_clear_val[port_num];
+		pr_info("%s using output mode with timestamping on %s edge, interval of %d milliseconds, offset of %d milliseconds, pulse width of %d microseconds, assert value of 0x%02x, clear value of 0x%02x\n",
+		           port->name,
+		           device->out_ts_clear_edge?"clear":"assert",
+		           device->interval, device->out_offset, 
+		           device->out_width, device->out_assert_val, device->out_clear_val);
 
 		hrtimer_init(&device->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		device->hrt.function = pps_hrt;
-		device->hrt_period_ns = ppps_interval * 1000000;
-		device->hrt_period = ktime_set(0, device->hrt_period_ns);
+		device->hrt_period_ns = device->interval * 1000000;
+		device->hrt_period = ns_to_ktime(device->hrt_period_ns);
 	}
 
 	if (ppps_echo || device->mode == PM_OUT) {
@@ -734,7 +924,7 @@ static void parport_attach(struct parport * __restrict const port)
 		pr_info("%s %d port output writes completed in %lld ns\n",
 			port->name, LOOP_CAL_COUNT, len_ns);
 	}
-	
+
 	device->wq = create_singlethread_workqueue("pps_wq");
 	if (device->wq == NULL) {
 		pr_err("%s couldn't create delay queue\n", port->name);
@@ -748,11 +938,18 @@ static void parport_attach(struct parport * __restrict const port)
 		/* enable interrupt */
 		queue_delayed_work(device->wq, &device->dw, STARTUP_DELAY);
 	} else {
+		/* todo: align to top of CLOCK_REALTIME second */
+		struct timespec64 ts;
+		ktime_t hst;
+		ktime_get_ts64(&ts);
+		hst = ktime_set(ts.tv_sec + 1,
+				device->out_offset * NSEC_PER_MSEC);
+
 		/* start pulsing */
-		hrtimer_start(&device->hrt, device->hrt_period,
-		              HRTIMER_MODE_REL);
+		device->out_waiting_for_clear_edge = 0;
+		hrtimer_start(&device->hrt, hst, HRTIMER_MODE_ABS);
 	}
-	
+
 	return;
 
 err_release_source:
@@ -789,8 +986,8 @@ static void parport_detach(struct parport *port)
 	if (device->wq) {
 		if (device->mode != PM_INT) {
 			device->mode = PM_SHUTDOWN; /* flag hrt callback */
-			/* wait in case polling is in progress */
-			msleep(100);
+			/* wait in case polling is in progress or in output mode */
+			msleep(1100);
 			hrtimer_cancel(&device->hrt);
 		}
 		cancel_delayed_work_sync(&device->dw); 
@@ -799,7 +996,7 @@ static void parport_detach(struct parport *port)
 	}
 	/* wait in case interrupt handler is running on another CPU */
 	msleep(100);
-	
+
 	if (device->pps)
 		pps_unregister_source(device->pps);
 
@@ -823,25 +1020,6 @@ static int __init pps_parport_init(void)
 	int ret;
 
 	pr_info(DRVDESC "\n");
-
-	if (ppps_interval > 10000 || ppps_interval < 500) {
-		pr_err("Expected PPS interval of %d is out of range. must be 500 to 10000 (milliseconds)\n",
-			ppps_interval);
-		return -EINVAL;
-	}
-	if (ppps_mask != 0 && (ppps_mask > 10000 || ppps_mask < 100)) {
-		pr_err("Interrupt mask value of %d is out of range. must be 0 or 100 to 10000 (milliseconds)\n",
-			ppps_mask);
-		return -EINVAL;
-	}
-
-	if (clear_wait > CLEAR_WAIT_MAX) {
-		pr_err("clear_wait value of %d polls is out of range. must be 0 to %d\n",
-			clear_wait, CLEAR_WAIT_MAX);
-		return -EINVAL;
-	} else if (clear_wait == 0) {
-		pr_info("clear edge capture disabled\n"); 
-	}
 
 	if (ppps_direct) {
 		pr_info("using port IO instructions directly\n");
