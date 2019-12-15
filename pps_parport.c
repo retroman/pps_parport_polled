@@ -25,7 +25,6 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
-#include <linux/irqnr.h>
 #include <linux/time.h>
 #include <linux/slab.h>
 #include <linux/parport.h>
@@ -63,7 +62,7 @@ MODULE_PARM_DESC(clear_wait,
 	"state that their clear edges are not to be used for timing.");
 
 /*
- * read_status and write_control don't get inlined due to no-strict-aliasing,
+ * read_status and write_data don't get inlined due to no-strict-aliasing,
  * and won't get inlined when built as a module even with -fstrict-aliasing and
  * restrict pointers, so use inb() and outb(). echo latency is reduced
  * significantly even on fast machines
@@ -80,7 +79,7 @@ static bool ppps_echo = false;
 DEFINE_STATIC_KEY_FALSE(echo);
 module_param(ppps_echo, bool, 0);
 MODULE_PARM_DESC(ppps_echo, 
-	"for all ports: echo ACK to SEL, "
+	"for all ports: echo ACK to data lines, "
 	"true to enable, false to disable. default false");
 
 static unsigned int ppps_interval[PARPORT_MAX+1] = {[0 ... PARPORT_MAX] = 1000};
@@ -118,9 +117,8 @@ MODULE_PARM_DESC(ppps_out_ts_clear_edge,
 
 #define CLEAR_WAIT_MAX_ERRORS 5
 
-#define SEL_HI 0x00
-#define SEL_LO_IRQ_MASKED   0x08
-#define SEL_LO_IRQ_UNMASKED 0x18
+#define ECHO_DATA_HI 0xff
+#define ECHO_DATA_LO 0x00
 
 #define STARTUP_DELAY msecs_to_jiffies(2200)
 
@@ -152,7 +150,7 @@ struct pps_client_pp {
 	int      interrupt_disabled; /*bool, but use int for alignment*/
 	int      mode;
 	int      status_addr;
-	int      control_addr;
+	int      data_addr;
 	struct   pardevice * __restrict pardev;
 	/* cache doesnt matter for the rest */
 	unsigned int cw;
@@ -205,12 +203,12 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 
 	/* local copies to minimize latency if strict aliasing is not enabled */
 	const unsigned int max_polls = dev->poll_trys;
-	const unsigned int s_addr = dev->status_addr, c_addr = s_addr + 1;
+	const unsigned int s_addr = dev->status_addr, d_addr = dev->data_addr;
 	unsigned int p, a_polls, cw_trys = dev->cw;
 	struct parport * __restrict const port = dev->pardev->port;
 	bool poll_fail;
 	unsigned char (* const read_status)(struct parport *) = port->ops->read_status;
-	void (* const write_control)(struct parport *, unsigned char value) = port->ops->write_control;
+	void (* const write_data)(struct parport *, unsigned char value) = port->ops->write_data;
 	int adj;
 
 	if (dev->mode == PM_SHUTDOWN) {
@@ -220,9 +218,9 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 	/* prepare rising edge echo if falling edge capture disabled */
 	if (ppps_echo && cw_trys == 0) {
 		if (static_branch_likely(&direct))
-			outb(SEL_LO_IRQ_MASKED, c_addr);
+			outb(ECHO_DATA_LO, d_addr);
 		else
-			write_control(port, 0);
+			write_data(port, ECHO_DATA_LO);
 	}
 
 	/* wait for input rising edge */
@@ -243,25 +241,25 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 	a_polls = max_polls - p;
 	if (ppps_echo && a_polls > 1 && a_polls < max_polls) {
 		if (static_branch_likely(&direct))
-			outb(SEL_HI, c_addr);
+			outb(ECHO_DATA_HI, d_addr);
 		else
-			write_control(port, PARPORT_CONTROL_SELECT);
+			write_data(port, ECHO_DATA_HI);
 	}
 	if (cw_trys > 0 && a_polls > 1 && a_polls < max_polls) {
-		/* NOTE: SEL will be lowered even if there was a timeout */
+		/* NOTE: echo will be lowered even if there was a timeout */
 		ktime_get_snapshot(&ss_clear);
 		if (static_branch_likely(&direct)) {
 			while (cw_trys-- && (inb(s_addr) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			ktime_get_snapshot(&ss_clear);
 			if (static_branch_likely(&echo))
-				outb(SEL_LO_IRQ_MASKED, c_addr);
+				outb(ECHO_DATA_LO, d_addr);
 		} else {
 			while (cw_trys-- && (read_status(port) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			ktime_get_snapshot(&ss_clear);
 			if (static_branch_likely(&echo))
-				write_control(port, 0);
+				write_data(port, ECHO_DATA_LO);
 		}
 
 		local_irq_restore(flags);
@@ -337,13 +335,13 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 /* parport interrupt handler */
 __aligned(64) static void parport_irq(void * __restrict const handle)
 {
-	unsigned int cw_trys, s_addr, c_addr;
+	unsigned int cw_trys, s_addr, d_addr;
 	unsigned long flags;
 	struct pps_client_pp * __restrict dev;
 	struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
 	struct parport * __restrict port;
 	unsigned char (*read_status)(struct parport *);
-	void (*write_control)(struct parport *, unsigned char value);
+	void (*write_data)(struct parport *, unsigned char value);
 
 	/* don't get interrupted while getting timestamp */
 	local_irq_save(flags);
@@ -363,10 +361,10 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 		/* echo here before reading port, but may cause false echos */
 		if (static_branch_likely(&echo)) {
 			if (static_branch_likely(&direct)) {
-				outb(SEL_HI, dev->control_addr);
+				outb(ECHO_DATA_HI, dev->data_addr);
 			} else {
 				port = dev->pardev->port;
-				port->ops->write_control(port, 0);
+				port->ops->write_data(port, ECHO_DATA_HI);
 			}
 		}
 	}
@@ -391,26 +389,26 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 		hrtimer_start(&dev->hrt, dev->hrt_initial_period,
 			HRTIMER_MODE_REL);
 	} else if (dev->cw) {
-		/* NOTE: SEL will be lowered even if there was a timeout */
+		/* NOTE: echo will be lowered even if there was a timeout */
 		cw_trys = dev->cw;
 		if (static_branch_likely(&direct)) {
 			s_addr = dev->status_addr;
-			c_addr = dev->control_addr;
+			d_addr = dev->data_addr;
 			ktime_get_snapshot(&ss_clear);
 			while (cw_trys-- && (inb(s_addr) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			ktime_get_snapshot(&ss_clear);
 			if (static_branch_likely(&echo))
-				outb(SEL_LO_IRQ_UNMASKED, c_addr);
+				outb(ECHO_DATA_LO, d_addr);
 		} else {
 			read_status = port->ops->read_status;
-			write_control = port->ops->write_control;
+			write_data = port->ops->write_data;
 			ktime_get_snapshot(&ss_clear);
 			while (cw_trys-- && (read_status(port) &
 				PARPORT_STATUS_ACK) ASSERTED){}
 			ktime_get_snapshot(&ss_clear);
 			if (static_branch_likely(&echo))
-				write_control(port, PARPORT_CONTROL_SELECT);
+				write_data(port, ECHO_DATA_LO);
 		}
 		local_irq_restore(flags);
 		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
@@ -441,7 +439,7 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 		}
 		/* lower echo to create next echo rising edge */
 		if (ppps_echo)
-			port->ops->write_control(port, PARPORT_CONTROL_SELECT);
+			port->ops->write_data(port, ECHO_DATA_LO);
 	}
 	return;
 
@@ -449,7 +447,7 @@ ignore_irq_report:
 	dev_err(dev->pps->dev, "lost the signal, or got a shared interrupt from another device\n");
 	if (ppps_echo) {
 		port = dev->pardev->port;
-		port->ops->write_control(port, PARPORT_CONTROL_SELECT);
+		port->ops->write_data(port, ECHO_DATA_LO);
 	}
 ignore_irq:
 	local_irq_restore(flags);
@@ -459,12 +457,12 @@ static void parport_attach(struct parport * __restrict const port)
 {
 	struct pardev_cb pps_client_cb;
 	int index;
-	int pollct, ns_perpoll, s_addr, c_addr, port_num;
+	int pollct, ns_perpoll, s_addr, d_addr, port_num;
 	struct timespec64 start, end, len;
 	s64 len_ns, start_ns, end_ns;
 	unsigned long flags;
 	unsigned char (*read_status)(struct parport *);
-	void (*write_control)(struct parport *, unsigned char value);
+	void (*write_data)(struct parport *, unsigned char value);
 	unsigned char sta;
 
 	struct pps_client_pp * __restrict device;
@@ -579,10 +577,10 @@ static void parport_attach(struct parport * __restrict const port)
 	device->interrupt_disabled = 1;
 
 	device->cw_err = 0;
+	device->data_addr = port->base;
 	device->status_addr = port->base + 1;
-	device->control_addr = port->base + 2;
 	s_addr = device->status_addr;
-	c_addr = device->control_addr;
+	d_addr = device->data_addr;
 
 	if (device->mode == PM_POLL) {
 		if (KTIME_MONOTONIC_RES != KTIME_HIGH_RES) {
@@ -679,7 +677,6 @@ static void parport_attach(struct parport * __restrict const port)
 	}
 
 	if (ppps_echo) {
-		/* SEL is hw inverted, use low output for echo speed test */
 		pollct = LOOP_CAL_COUNT;
 
 		local_irq_save(flags);
@@ -689,14 +686,14 @@ static void parport_attach(struct parport * __restrict const port)
 			ktime_get_raw_ts64(&end);
 			ktime_get_raw_ts64(&start);
 			while (pollct--)
-				outb(SEL_LO_IRQ_MASKED, c_addr);
+				outb(ECHO_DATA_LO, d_addr);
 			ktime_get_raw_ts64(&end);
 		} else {
-			write_control = port->ops->write_control;
+			write_data = port->ops->write_data;
 			ktime_get_raw_ts64(&end);
 			ktime_get_raw_ts64(&start);
 			while (pollct--)
-				write_control(port, PARPORT_CONTROL_SELECT);
+				write_data(port, ECHO_DATA_LO);
 			ktime_get_raw_ts64(&end);
 		}
 		local_irq_restore(flags);
@@ -797,7 +794,7 @@ static int __init pps_parport_init(void)
 		static_branch_enable(&direct);
 	}
 	if (ppps_echo) {
-		pr_info("SEL pin echo enabled\n");
+		pr_info("echo on D0-D7 lines enabled\n");
 		static_branch_enable(&echo);
 	}
 
