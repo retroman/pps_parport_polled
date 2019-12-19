@@ -336,17 +336,14 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 __aligned(64) static void parport_irq(void * __restrict const handle)
 {
 	unsigned int cw_trys, s_addr, d_addr;
-	unsigned long flags;
 	struct pps_client_pp * __restrict dev;
 	struct ____cacheline_aligned system_time_snapshot ss_assert, ss_clear;
 	struct parport * __restrict port;
 	unsigned char (*read_status)(struct parport *);
 	void (*write_data)(struct parport *, unsigned char value);
 
-	/* don't get interrupted while getting timestamp */
-	local_irq_save(flags);
-
-	/*
+	/* 
+	 * note: don't need local_irq_save() since 2.6.35
 	 * get the timestamp here even in polling mode. will waste CPU
 	 * in polled mode, and if using a shared interrupt, but reduces latency
 	 */
@@ -375,8 +372,6 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 		goto ignore_irq_report;
 
 	if (dev->mode == PM_POLL) {
-		local_irq_restore(flags);
-
 		/* mask interrupt. hrtimer will re-enable if needed */
 		port->ops->disable_irq(port);
 		dev->interrupt_disabled = 1;
@@ -410,7 +405,6 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 			if (static_branch_likely(&echo))
 				write_data(port, ECHO_DATA_LO);
 		}
-		local_irq_restore(flags);
 		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
 
 		if (unlikely(cw_trys == 0)) {
@@ -424,7 +418,6 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 			dev->cw_err = 0;
 		}
 	} else {
-		local_irq_restore(flags);
 		ss_pps_event(dev->pps, &ss_assert, PPS_CAPTUREASSERT);
 		/*
 		 * level-triggered interrupt workaround: wait before
@@ -450,7 +443,7 @@ ignore_irq_report:
 		port->ops->write_data(port, ECHO_DATA_LO);
 	}
 ignore_irq:
-	local_irq_restore(flags);
+	return;
 }
 
 static void parport_attach(struct parport * __restrict const port)
