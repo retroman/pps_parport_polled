@@ -267,7 +267,7 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 			local_irq_restore(flags);
 			if (dev->cw_err++ >= CLEAR_WAIT_MAX_ERRORS) {
 				dev->cw = 0;
-				dev_err(&dev->pps->dev, "disabled clear edge capture after %d consecutive timeouts\n",
+				dev_err(dev->pps->dev, "disabled clear edge capture after %d consecutive timeouts\n",
 					CLEAR_WAIT_MAX_ERRORS);
 			}
 		} else {
@@ -279,11 +279,11 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 
 	if (unlikely(a_polls == 1)) {
 		poll_fail = true;
-		dev_info(&dev->pps->dev,
+		dev_info(dev->pps->dev,
 			"ACK asserted at poll start, disabling polling until next interrupt\n");
 	} else if (unlikely(a_polls >= max_polls)) {
 		poll_fail = true;
-		dev_info(&dev->pps->dev,
+		dev_info(dev->pps->dev,
 			"poll timeout, disabling polling until next interrupt\n");
 	} else {
 		poll_fail = false;
@@ -319,11 +319,11 @@ __aligned(64) static enum hrtimer_restart pps_hrt(struct hrtimer * __restrict co
 	}
 	if (adj >= 0) {
 		dev->hrt_period = ktime_add_ns(dev->hrt_period, adj);
-		dev_dbg(&dev->pps->dev, "polled ok: %d  wait time  added %llu\n",
+		dev_dbg(dev->pps->dev, "polled ok: %d  wait time  added %llu\n",
 			a_polls, ktime_to_ns(dev->hrt_period));
 	} else {
 		dev->hrt_period = ktime_sub_ns(dev->hrt_period, -adj);
-		dev_dbg(&dev->pps->dev, "polled ok: %d  wait time subbed %llu\n",
+		dev_dbg(dev->pps->dev, "polled ok: %d  wait time subbed %llu\n",
 			a_polls, ktime_to_ns(dev->hrt_period));
 	}
 	dev->prev_pollct = a_polls;
@@ -410,7 +410,7 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 		if (unlikely(cw_trys == 0)) {
 			if (dev->cw_err++ >= CLEAR_WAIT_MAX_ERRORS) {
 				dev->cw = 0;
-				dev_err(&dev->pps->dev, "disabled clear edge capture after %d consecutive timeouts\n",
+				dev_err(dev->pps->dev, "disabled clear edge capture after %d consecutive timeouts\n",
 					CLEAR_WAIT_MAX_ERRORS);
 			}
 		} else {
@@ -437,7 +437,7 @@ __aligned(64) static void parport_irq(void * __restrict const handle)
 	return;
 
 ignore_irq_report:
-	dev_err(&dev->pps->dev, "lost the signal, or got a shared interrupt from another device\n");
+	dev_err(dev->pps->dev, "lost the signal, or got a shared interrupt from another device\n");
 	if (ppps_echo) {
 		port = dev->pardev->port;
 		port->ops->write_data(port, ECHO_DATA_LO);
@@ -483,9 +483,6 @@ static void parport_attach(struct parport * __restrict const port)
 	}
 
  	index = ida_simple_get(&pps_client_index, 0, 0, GFP_KERNEL);
-	if (index < 0) {
-		goto err_free_device;
-	}
  	memset(&pps_client_cb, 0, sizeof(pps_client_cb));
  	pps_client_cb.private = device;
  	pps_client_cb.irq_func = parport_irq;
@@ -496,7 +493,7 @@ static void parport_attach(struct parport * __restrict const port)
 	        index);
 	if (!device->pardev) {
 		pr_err("couldn't register with %s\n", port->name);
-		goto err_free_ida;
+		goto err_free;
 	}
 
 	if (parport_claim_or_block(device->pardev) < 0) {
@@ -557,7 +554,7 @@ static void parport_attach(struct parport * __restrict const port)
 		pr_err("clear_wait value of %d polls for %s is out of range. must be 0 to %d\n",
 			device->cw, port->name, CLEAR_WAIT_MAX);
 		goto err_release_source;
-	} else if (clear_wait[port_num] == 0) {
+	} else if (clear_wait == 0) {
 		pr_info("clear edge capture disabled\n");
 	}
 
@@ -662,7 +659,8 @@ static void parport_attach(struct parport * __restrict const port)
 		/* interrupt mask time for polling loop failure */
 		device->mask_jiffies = msecs_to_jiffies(device->interval - 100);
 
-		hrtimer_setup(&device->hrt, pps_hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		hrtimer_init(&device->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		device->hrt.function = pps_hrt;
 		device->hrt_period_ns = device->interval * 1000000;
 		device->hrt_period = ns_to_ktime(device->hrt_period_ns);
 		device->hrt_initial_period = ns_to_ktime( 
@@ -728,9 +726,8 @@ err_unregister_dev:
 	 * module unload
 	 */
 	return;
-err_free_ida:
-	ida_free(&pps_client_index, index);
-err_free_device:
+err_free:
+	ida_simple_remove(&pps_client_index, index);
 	kfree(device);
 }
 
@@ -766,7 +763,7 @@ static void parport_detach(struct parport *port)
 
 	parport_release(pardev);
 	parport_unregister_device(pardev);
-	ida_free(&pps_client_index, device->index);
+	ida_simple_remove(&pps_client_index, device->index);
 	kfree(device);
 }
 
@@ -774,6 +771,7 @@ static struct parport_driver pps_parport_driver = {
 	.name = KBUILD_MODNAME,
 	.match_port = parport_attach,
 	.detach = parport_detach,
+	.devmodel = true,
 };
 
 /* module stuff */

@@ -1,9 +1,9 @@
-modified Linux parallel port PPS client driver, for kernel version 4.11 and newer
+Linux parallel port PPS client driver with an option to use polling instead of interrupts
 
 replace pps_parport.c in drivers/pps/clients
 optionally replace Makefile (adds optimization)
 build as a module
 
-
-will also work with kernel versions 4.1 to 4.10 with minor modification
+current version is compatible with kernel version 6.17+
+previous versions: 4.11 to 6.16, 4.1 to 4.10
 
