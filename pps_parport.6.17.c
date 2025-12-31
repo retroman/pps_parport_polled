@@ -482,7 +482,7 @@ static void parport_attach(struct parport * __restrict const port)
 		return;
 	}
 
-	index = ida_alloc(&pps_client_index, GFP_KERNEL);
+ 	index = ida_simple_get(&pps_client_index, 0, 0, GFP_KERNEL);
 	if (index < 0) {
 		goto err_free_device;
 	}
